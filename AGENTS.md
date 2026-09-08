@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 Project guidelines for AI agents working in this codebase.
 
@@ -24,14 +24,16 @@ A proxy that bridges OpenCode (Anthropic API format) to Claude Max (Agent SDK). 
 ## Commands
 
 ```bash
-npm test          # Full suite with process-global mocks isolated
+npm test          # Run all tests — ALWAYS use this, never bare `bun test`
 npm run build     # Bundle with Bun, emit declarations and check Node entrypoints
 npm start         # Start the proxy server
-npm run typecheck # tsc --noEmit; tests do not typecheck
+npm run typecheck # tsc --noEmit (CI runs this separately; tests do not typecheck)
 ```
 
-Use `npm test` for the full suite, not bare `bun test`: the npm script runs
-process-global mock users in separate Bun invocations.
+**`npm test` is not a thin wrapper around `bun test`.** Some files use
+process-global mocks; the npm script excludes those from the main pass and runs
+them in separate Bun invocations. Use that script for the full suite. Targeted
+`bun test <file>` runs are useful during development but do not replace it.
 
 ## Code Rules
 
@@ -39,7 +41,7 @@ process-global mock users in separate Bun invocations.
 
 - **Do not add code to `server.ts` that belongs in a leaf module.** If it's pure logic (no HTTP, no Hono), extract it.
 - **`session/lineage.ts` must stay pure.** No side effects, no I/O, no imports from cache or server.
-- **Leaf modules (`errors.ts`, `models.ts`, `tools.ts`, `messages.ts`) must not import from `server.ts` or `session/`.** Dependencies flow downward only.
+- **Leaf modules (`errors.ts`, `retryAfter.ts`, `models.ts`, `tools.ts`, `messages.ts`) must not import from `server.ts` or `session/`.** Dependencies flow downward only.
 - **No circular dependencies.**
 
 ### Agent-Specific Logic
@@ -77,20 +79,29 @@ OpenCode-specific behavior is documented in `ARCHITECTURE.md` under "Agent-Speci
 
 ```
 server.ts          → HTTP routes, SSE streaming, concurrency (orchestration only)
+concurrency.ts     → Abortable SDK query semaphore, max-concurrency config
+requestAbort.ts    → HTTP request abort → SDK query abort bridge
+sessionTree.ts     → Live parent→child request registry, subtree cancellation (PURE bookkeeping)
+shutdown.ts        → Bounded HTTP drain, socket tracking, forced close
 adapter.ts         → AgentAdapter interface (extensibility point)
 adapters/
   opencode.ts      → OpenCode-specific: headers, CWD, tool config
   forgecode.ts     → ForgeCode-specific: XML CWD, patch/shell tools, passthrough
 query.ts           → buildQueryOptions (shared stream/non-stream SDK call builder)
 errors.ts          → classifyError (pure)
+retryAfter.ts      → Retry-After seconds for 429/503/529 (PURE)
 models.ts          → mapModelToClaudeModel, resolveClaudeExecutableAsync
+buildInfo.ts       → build provenance + semver compare (PURE)
+updateCheck.ts     → cached npm registry check for the newest release
 tools.ts           → BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME
 messages.ts        → normalizeContent, getLastUserMessage (pure)
 fileChanges.ts     → PostToolUse hook: file write/edit tracking + summary formatting (pure)
+design.ts          → Claude Design MCP proxy: token store/refresh, auth precedence, login flow
 session/
   lineage.ts       → Hashing, lineage verification (PURE — no I/O)
   fingerprint.ts   → extractClientCwd, getConversationFingerprint
   cache.ts         → LRU caches, lookupSession, storeSession (stateful)
+  turnCoordinator.ts → Process-wide strict serialization for reliable session IDs
 ```
 
 ## Stable API Contract
@@ -105,10 +116,10 @@ External plugins depend on these interfaces. **Do not change without project own
 | `x-opencode-session` header | `adapters/opencode.ts` | Session tracking from agent plugins |
 | `x-meridian-profile` header | `server.ts`, `profiles.ts` | Per-request profile selection |
 | `GET /health` response shape | `server.ts` | Plugin health checks |
+| `/health` `build` block | `buildInfo.ts` | Version/provenance drift detection |
 | `POST /v1/messages` request/response format | `server.ts` | All agents (Anthropic API contract) |
 | `GET /profiles/list` response shape | `server.ts` | Profile management UI and CLI |
 | `POST /profiles/active` request/response | `server.ts` | Profile switching from CLI and UI |
-
 If you need to modify any of these, open an issue first — breaking changes affect downstream plugin authors.
 
 ## Git & Workflow
