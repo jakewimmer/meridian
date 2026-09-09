@@ -45,7 +45,7 @@ import { exec as execCallback } from "child_process"
 import { promisify } from "util"
 import { randomUUID } from "crypto"
 import { withClaudeLogContext } from "../logger"
-import { createPassthroughMcpServer, stripMcpPrefix, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX } from "./passthroughTools"
+import { createPassthroughMcpServer, resolveClientToolName, normalizeToolInput, hasRepairableToolInput, computeToolSetKey, toolUseSignature, PASSTHROUGH_MCP_NAME, PASSTHROUGH_MCP_PREFIX } from "./passthroughTools"
 import { detectServerTools, serverToolErrorMessage } from "./tools"
 import { clientAbortDisposition, coalesceCompleteToolResultContinuation, createEarlyStopTracker, isClientForwardedToolUse, noteAssistantMessage, noteUserContent, settledToolCallAssistantUuid, shouldEarlyStop, trackerCoversStreamedCalls } from "./passthroughEarlyStop"
 import { checkEmptyToolInputs, checkUndeliveredToolUses, type EnvelopeViolation } from "./envelopeIntegrity"
@@ -74,7 +74,7 @@ import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDef
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
 import { normalizeJcodeSessionId } from "./adapters/jcode"
-import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
+import { translateResponsesToAnthropic, translateAnthropicToResponses, createResponsesSseTranslator, reasoningRequested, buildResponsesToolAliases, type ResponsesRequest, type AnthropicSseEvent as ResponsesAnthropicSseEvent } from "./openaiResponses"
 import { flattenAssistantContent, normalizeStructuredUserContent, replayToolResultHeader, frameStructuredReplay, coalesceStructuredUserMessages } from "./replay"
 import { extractAdvisorModel, extractSystemText, getLastUserMessage, stripAdvisorTools, stripNonStandardStreamFields, MULTIMODAL_TYPES, buildToolUseIndex, frameReplayTurns } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
@@ -3003,7 +3003,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                 }
                 markPriorityAttemptExposure("tool_use")
                 // Track deferred tools that were discovered via ToolSearch
-                const toolName = stripMcpPrefix(input.tool_name)
+                const toolName = resolveClientToolName(input.tool_name, passthroughMcp?.clientNameByAlias)
                 if (hasDeferredTools && coreSet && !coreSet.has(toolName.toLowerCase())) {
                   discoveredTools.add(toolName)
                 }
@@ -3747,7 +3747,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     }
                     // In passthrough mode, strip MCP prefix from tool names
                     if (passthrough && b.type === "tool_use" && typeof b.name === "string") {
-                      b.name = stripMcpPrefix(b.name as string)
+                      b.name = resolveClientToolName(b.name as string, passthroughMcp?.clientNameByAlias)
                     }
                     contentBlocks.push(b)
                   }
@@ -4946,8 +4946,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                         }
                         if (passthrough && block.name.startsWith(PASSTHROUGH_MCP_PREFIX)) {
                           // Passthrough mode: SDK sent the name WITH the mcp__oc__ prefix.
-                          // Strip it so OpenCode sees the bare tool name.
-                          block.name = stripMcpPrefix(block.name)
+                          // Resolve it back to the name the client declared — usually just
+                          // the prefix stripped, but not for a client tool whose own name
+                          // carries this namespace (#967).
+                          block.name = resolveClientToolName(block.name, passthroughMcp?.clientNameByAlias)
                           if (block.id) streamedToolUseIds.add(block.id)
                         } else if (block.name.startsWith("mcp__")) {
                           // Internal MCP tool (mcp__opencode__* etc.) — skip, SDK handles it
@@ -4957,7 +4959,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           // Passthrough mode: SDK already stripped the mcp__oc__ prefix before
                           // emitting the stream_event (observed in practice — the SDK normalises
                           // tool names in stream events). Track the ID so the early-break
-                          // condition fires correctly.
+                          // condition fires correctly. The name here is the registered alias,
+                          // so it still needs resolving back to what the client declared —
+                          // for an ordinary tool that is a no-op.
+                          block.name = resolveClientToolName(block.name, passthroughMcp?.clientNameByAlias)
                           streamedToolUseIds.add(block.id)
                         }
                         if (passthrough && eventIndex !== undefined) {
@@ -7585,7 +7590,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
     const responseId = `resp_${randomUUID().replace(/-/g, "")}`
     const created = Math.floor(Date.now() / 1000)
     const model = (typeof rawBody.model === "string" && rawBody.model) ? rawBody.model : CANONICAL_SONNET_MODEL
-    const ctx = { responseId, model, created, reasoningRequested: reasoningRequested(rawBody) }
+    // Namespaced (MCP) and custom tools reach Claude under aliases; the same
+    // table turns its calls back into Codex's `{namespace, name}` items.
+    const toolAliases = buildResponsesToolAliases(rawBody.tools)
+    const ctx = { responseId, model, created, reasoningRequested: reasoningRequested(rawBody), toolAliases }
 
     if (!anthropicBody.stream) {
       const anthropicRes = await internalRes.json() as Record<string, unknown>
