@@ -266,6 +266,11 @@ UI. Both fixtures isolate Meridian state and work only in temporary directories.
 | E40 | [Passthrough digest-turn cap](#e40-passthrough-digest-turn-cap) | **Automated**: `bun scripts/e2e-digest-turn-cap.mjs` — real SDK. Asserts the capped tool turn generates no digest text, costs materially less than uncapped on an identical prompt, still RESUMES at its captured checkpoint, leaves text-only turns returning `success`, and does not truncate parallel tool calls. **Run before any release touching the passthrough tool loop, `maxTurns`, or the early-stop checkpoint** | 2026-08-20 |
 | E41 | [Passthrough multi-turn: one call, one answer](#e41-passthrough-multi-turn-one-call-one-answer) | **Automated**: `bun scripts/e2e-passthrough-turns.mjs [--stream]` — real proxy + SDK + Claude Max. Chain and `PROBE_PARALLEL=1` modes assert exact tool-call batching, a distinct durable fork per result round, one real answer per delivered call in the active transcript, and full prompt-cache continuity. **Run all four chain/parallel × stream/non-stream combinations before releases touching passthrough resume or the deny hook** | 2026-08-26 |
 | E42 | [OpenCode V2 beta compatibility](#e42-opencode-v2-beta-compatibility) | **Automated**, exact betas `18314` and `18866`: run `e2e-opencode-v2-package.mjs --live --extended` with each pinned binary. Covers hidden title/summary isolation, process restart, passthrough tools, undo/fork/compaction and overlapping general children. Also test source and packed npm artifacts. **Run after any V2 plugin/API change; another beta is not a pass** | 2026-08-27 |
+| E43 | [Passthrough tools in a namespaced client](#e43-passthrough-tools-in-a-namespaced-client) | **Automated**: `bun scripts/e2e-passthrough-namespaced-tools.mjs [--stream]` — real proxy + SDK. A client tool declared `mcp__oc__read` collides with the namespace Meridian nests client tools under; asserts the call is still dispatched and captured, delivered under the name the client declared, and answered from the client's real result, with an ordinary and a foreign-namespace control alongside. **Run before any release touching passthrough tool registration, the deny hook, or tool-name delivery** | 2026-09-08 |
+| E44 | [Tier refusal failover](#e44-tier-refusal-failover) | **Automated**: `bun scripts/e2e-tier-refusal-failover.mjs [--stream]` — local refusal fixture, **real Claude Max fallback**. Asserts the credits-era per-tier banner is recorded 429 on the refusing profile and that a healthy profile actually answers. Catches what unit tests cannot: the shape that arrives carries the upstream status. **Run before releases touching error classification or priority failover** | 2026-09-08 |
+| E45 | [Codex auto-defer](#e45-codex-auto-defer) | **Automated**: `bun scripts/e2e-codex-auto-defer.mjs` — real proxy + SDK, 40 Codex-shaped tools. Asserts a Codex request reports no deferral and that `exec_command` is loaded rather than found via ToolSearch. The codex transform inherited OpenCode's core tool names, which match nothing Codex sends, so every tool was deferred. **Run before releases touching the codex transform, auto-defer, or `computePassthroughMaxTurns`** | 2026-09-08 |
+| E46 | [Codex namespace and MCP tools](#e46-codex-namespace-and-mcp-tools) | **Automated**: `bun scripts/e2e-codex-namespace-tools.mjs [--stream]` — real proxy + SDK. Codex 0.15x sends MCP servers as `{type:"namespace", tools:[...]}`, which the Responses translator dropped. Asserts namespaced tools reach Claude, calls come back carrying `namespace`, and a `function_call_output` whose output is a content-item ARRAY does not 400. **Run before releases touching the Responses translator or Codex tool handling** | 2026-09-08 |
+| E48 | [Responses developer-note cache](#e48-responses-developer-note-cache) | **Automated**: `bun scripts/e2e-responses-developer-cache.mjs` — real proxy + SDK, A/B. A `developer` item folded into `system` mid-conversation re-wrote the whole cached prefix. Asserts the note's turn re-writes no more than the control's (measured 7.8x pre-fix, 1.2x after). **Run before releases touching Responses prompt assembly or system-block construction** | 2026-09-08 |
 
 | P1 | [Profile: List & Auth Status](#p1-profile-list--auth-status) | `/profiles/list` returns profiles with emails, login status, auth timestamps | - |
 | P2 | [Profile: Switch via API](#p2-profile-switch-via-api) | `POST /profiles/active` switches profile; health endpoint reflects new email | - |
@@ -3848,6 +3853,243 @@ Run this real-client sequence:
 `EXACTUNDO`, `EXACTFORK`, `EXACTORIGINAL`,
 `EXACTPARALLEL[ALPHA,BRAVO]`, and `EXACTAFTERCOMPACT`. The binary SHA-256 stayed
 unchanged through the matrix.
+
+## E43: Passthrough tools in a namespaced client
+
+**What it proves:** a client whose own tool names already carry an MCP
+namespace can still receive, execute, and answer a forwarded passthrough call.
+
+**Why it needs the real SDK:** Meridian nests client tools inside its own `oc`
+MCP server, so a client that aggregates MCP servers itself — a Claude Code CLI
+job with an `oc` server configured, for instance — declares tools like
+`mcp__oc__read` that collide with that namespace. The collision broke two
+things at once, and only one of them is visible to a mocked SDK:
+
+- **Registration.** The tool was advertised as `mcp__oc__mcp__oc__read`. On SDK
+  0.2.141 / CLI 2.1.263 the CLI lists that name but never dispatches it, so the
+  PreToolUse hook never fired and nothing was captured (`tools=0/1` in the
+  `sdk_termination` line). Non-streaming returned HTTP 500; streaming ended
+  `stop_reason: max_tokens` with an inline `error` event.
+- **Delivery.** The reverse translation was a blind prefix strip, so the leaked
+  tool_use reached the client renamed to `read` — a tool it never declared.
+
+Either half breaks the promise the forwarding hook makes to the model ("the
+result will be delivered in a future turn"): a client cannot answer a call it
+does not recognize, so that turn never comes, and a coordinator watching the
+stalled job re-dispatches it (#967).
+
+```bash
+bun scripts/e2e-passthrough-namespaced-tools.mjs
+bun scripts/e2e-passthrough-namespaced-tools.mjs --stream
+PROBE_MODEL=claude-opus-5 bun scripts/e2e-passthrough-namespaced-tools.mjs
+PROBE_MODEL=claude-opus-5 bun scripts/e2e-passthrough-namespaced-tools.mjs --stream
+```
+
+**Pass criteria** (asserted per tool shape and response mode, non-zero exit on any):
+
+- The call is dispatched and captured: `stop_reason: tool_use`, exactly one
+  tool_use block, no error event.
+- The delivered name is byte-identical to what the client declared, and its
+  arguments survive.
+- Replaying that call's real `tool_result` yields an answer quoting the
+  fixture's content, and the answer never claims the call went unanswered.
+- The ordinary (`read`) and foreign-namespace (`mcp__zed__read`) controls pass
+  in the same process, so a green run cannot come from a dead proxy.
+
+The fixture uses a deliberately short `/tmp` path. Under macOS `mkdtemp`, Opus
+truncates a `/private/var/folders/...`-length path in its own tool argument and
+says so in its reply — a model artifact that would fail the argument check for a
+reason unrelated to what this gate measures.
+
+**Verified:** 2026-09-08 on the fix branch, SDK 0.2.141 / bundled CLI 2.1.259 /
+system CLI 2.1.263. All four combinations passed: haiku and `claude-opus-5`,
+streaming and non-streaming, subject plus both controls. Against the same commit
+without the fix, the subject shape returned HTTP 500 non-streaming and delivered
+`read` with `stop_reason: max_tokens` streaming.
+
+## E44: Tier refusal failover
+
+**What it proves:** a credits-era per-tier refusal is classified as a rate limit
+and priority routing really moves the request to a healthy profile.
+
+**Why unit tests were not enough.** `classifyError` returned
+`rate_limit_error` for the banner as quoted in #962 while the live request still
+returned 500 and failed nothing over. The reason is that an API-key or gateway
+profile never delivers the banner bare — the SDK splices the upstream status in
+front of it:
+
+```
+Claude Code returned an error result: API Error: 400 You've reached your Fable limit. Switch to another model to continue.
+```
+
+That numeric status sat between the accepted wrappers and the banner and
+defeated the line anchor for *every* suffix, including the two that already
+worked. Only driving the real failover path surfaced it.
+
+```bash
+bun scripts/e2e-tier-refusal-failover.mjs
+bun scripts/e2e-tier-refusal-failover.mjs --stream
+```
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- A pre-flight check that the banner classifies as `rate_limit_error` and that
+  the type is a failover trigger, so a classifier regression is named as such
+  rather than surfacing as a confusing routing failure.
+- The real CLI reaches the refusal upstream on every case — a cooldown carried
+  over from the previous case cannot let a run skip straight to the fallback.
+- Exactly one refused attempt, recorded against the refusing profile with
+  status **429**, not 500.
+- HTTP 200 overall, exactly one served row, served by the healthy profile, and
+  the real Claude Max fallback answers with the run's receipt string.
+
+**What is stubbed, and why that is acceptable.** The refusal is a local fixture
+upstream: producing this banner for real means exhausting a real Fable tier on
+a real account, which a gate cannot do on demand. The **fallback leg is real** —
+a live Claude Max profile answering a live prompt — so what is stubbed is the
+condition we cannot cause, not the behavior under test.
+
+**Verified:** 2026-09-08. Both modes pass. Against the contributor's suffix fix
+alone the gate fails with the refused attempt recorded 500 and no failover,
+which is what identified the missing status allowance.
+
+## E45: Codex auto-defer
+
+**What it proves:** a Codex request past the auto-defer threshold keeps its
+tools loaded, and `exec_command` in particular does not have to be discovered
+before it can be used.
+
+**Why it needs the real SDK.** `codexTransforms` runs after the shared OpenCode
+transform and inherited its `coreToolNames`
+(`read, write, edit, bash, glob, grep`). Codex sends none of those names, so
+once a session crossed the threshold — trivial for Codex, which inlines every
+MCP namespace's tool definitions — the core set matched nothing and **every**
+tool was deferred, `exec_command` included. Live pre-fix diagnostic:
+
+```
+deferred=40/40 tools (core: read,write,edit,bash,glob,grep)
+discovered=1 (exec_command) session_total=1
+```
+
+Deferral also has a second cost: `computePassthroughMaxTurns` only returns the
+single-turn cap when `singleTurnHandoff` holds, and that requires
+`!hasDeferredTools` — so turning deferral on lifted the cap from 1 to 4 and let
+the SDK's discarded digest turn generate on the full context.
+
+```bash
+bun scripts/e2e-codex-auto-defer.mjs
+```
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- No `deferred=` diagnostic. That line is the observable for
+  `hasDeferredTools`, which is what moves the turn cap.
+- No `discovered=` diagnostic — `exec_command` is loaded directly rather than
+  costing a ToolSearch round trip.
+- HTTP 200, at least one `function_call` returned, and one of them named
+  `exec_command`. These are regression guards, not discriminators: they pass
+  before and after, and exist so a "fix" that merely made the prompt cheaper
+  while breaking Codex would still fail.
+
+**What this gate does NOT prove.** The digest-turn cost is real but
+scale-dependent — #963 measured 2–3× cache reads per turn on a 680k-token
+session, and a 40-tool probe on a short prompt does not reliably provoke the
+extra turn. The model-call count is therefore reported, not asserted, so the
+gate does not carry a check that looks meaningful and discriminates nothing.
+
+**Verified:** 2026-09-08. Against pre-fix code the first two checks fail with
+the diagnostics quoted above; with the fix all five pass.
+
+## E46: Codex namespace and MCP tools
+
+**What it proves:** a Codex session's MCP tools reach Claude, its calls come
+back in a form Codex can route, and a turn replaying an MCP result succeeds.
+
+**The shapes were taken from a real capture, not from docs.** codex-cli 0.153.4
+was pointed at a recording endpoint with an actual stdio MCP server attached.
+It sent 13 top-level tool entries: 10 flat `function`, one `web_search`, and
+**2 `namespace` entries holding 7 nested tools**. Feeding that captured request
+through the pre-fix translator, 10 tools reached Claude and all 7 namespaced
+ones vanished — including Codex's own `multi_agent_v1` namespace
+(`spawn_agent`, `wait_agent`, …), so sub-agents were unavailable, not just the
+user's MCP server.
+
+```bash
+bun scripts/e2e-codex-namespace-tools.mjs
+bun scripts/e2e-codex-namespace-tools.mjs --stream
+```
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- The flattened client tool count reaches Claude (`tools=4` for the fixture:
+  one flat plus three nested; `web_search` is correctly dropped, having no
+  client-side counterpart).
+- A `function_call` comes back named as Codex declared it and **carrying its
+  `namespace`**. Codex's router resolves `ToolName::new(namespace, name)`, so a
+  flattened name is silently unroutable — the call looks fine and never
+  dispatches.
+- A follow-up turn whose `function_call_output.output` is an **array of content
+  items** returns 200 and the model answers from it. MCP tools return arrays;
+  passed verbatim they reach Anthropic as `tool_result.content[0].type =
+  "input_text"` and 400, killing every turn after an MCP call.
+
+**Harness note.** In streaming, `function_call` arguments arrive as their own
+delta events and the completed item can carry an empty `arguments`. The gate
+accumulates them before replaying turn 2 — without that it replays an
+argument-less call, the model simply calls the tool again, and the run looks
+like a broken emitter when the emitter is fine.
+
+**Not covered.** Codex's freeform `apply_patch` (`{type:"custom", format:
+{grammar}}`) did not appear in a default-config capture, so the custom-tool
+path is covered by unit tests only and is **not** live-verified here.
+
+**Verified:** 2026-09-08, both modes. Against pre-fix code the same gate fails
+with `tools=1` and no call returned.
+
+## E48: Responses developer-note cache
+
+**What it proves:** a `developer` item that first appears mid-conversation does
+not invalidate the prompt cache for the whole history.
+
+Anthropic caches the prompt as one prefix ordered **tools → system →
+messages**. `/v1/responses` folded every `developer`/`system` input item into
+the Anthropic `system` block regardless of position, so a note arriving on turn
+N rewrote `system` and invalidated everything behind the tools block. Codex
+emits exactly these as ordinary conversation events —
+`<image_resize_notice>` after `view_image`, `<model_switch>` and
+`<collaboration_mode>` on a model change, `<app-context>` on app refresh.
+
+A real codex-cli 0.153.4 capture confirms the harness preamble arrives as a
+**leading** `developer` item (`input roles: ["developer","user",...]`). That case
+must keep folding into `system`; only a note arriving after the conversation
+starts is inlined.
+
+```bash
+bun scripts/e2e-responses-developer-cache.mjs
+```
+
+**Pass criteria** (asserted, non-zero exit on any):
+
+- Both conversations complete, and the control's second turn reads its prefix
+  from cache.
+- **The note's turn re-writes no more than 3x the control's `cache_write`.**
+
+**Why the assertion is a ratio, not a hit rate.** Hit percentage does not scale
+down to a probe. The reported collapse was on a ~700k-token thread where
+`system` sits behind a ~125k tools block, so losing everything behind it cost
+240k-584k tokens. In a ~6.5k probe the same bug only moves the rate from 98% to
+~86%, which any sensible percentage threshold waves through — an earlier draft
+of this gate passed both before and after for exactly that reason. Re-written
+tokens are the invariant:
+
+```
+pre-fix   A cache_write=99    B cache_write=769   ->  7.8x   FAIL
+with fix  A cache_write=117   B cache_write=141   ->  1.2x   PASS
+```
+
+The hit rate is still printed, as context rather than as a check.
+
+**Verified:** 2026-09-08. Discriminates as tabled above.
 
 ## Concurrent transcript publication
 
